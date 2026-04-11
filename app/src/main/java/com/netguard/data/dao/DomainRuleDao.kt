@@ -39,4 +39,7 @@ interface DomainRuleDao {
 
     @Query("SELECT COUNT(*) FROM domain_rules WHERE source != 'user'")
     suspend fun blocklistCount(): Int
+
+    @Query("SELECT COUNT(*) FROM domain_rules WHERE source = :source")
+    suspend fun countBySource(source: String): Int
 }

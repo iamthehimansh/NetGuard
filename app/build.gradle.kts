@@ -20,13 +20,24 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("netguard-release.jks")
+            storePassword = envProps.getProperty("KEYSTORE_PASSWORD", "")
+            keyAlias = envProps.getProperty("KEY_ALIAS", "netguard")
+            keyPassword = envProps.getProperty("KEY_PASSWORD", "")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
