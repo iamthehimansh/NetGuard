@@ -59,6 +59,12 @@ class NetGuardVpnService : VpnService() {
     private var blockedAppUids = setOf<Int>()
     private var upstreamDns = "8.8.8.8"
 
+    // Cache: domain → (uid, timestamp). When UID lookup fails for a domain
+    // we recently saw from a blocked app, treat it as blocked too.
+    // This fixes the UDP socket race condition where the socket closes
+    // before we can look up the UID.
+    private val domainUidCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
+
     @Volatile
     private var running = false
 
@@ -240,9 +246,24 @@ class NetGuardVpnService : VpnService() {
             val query = DnsPacketParser.parseQuery(dnsData, dnsData.size) ?: return
             val domain = query.domain
 
-            // Resolve which app sent this
-            val appUid = resolveUidForDns(srcPort, fullPacket, ihl)
-            val appName = if (appUid >= 0) uidResolver?.getPackageName(appUid) else null
+            // Resolve which app sent this DNS query
+            var appUid = resolveUidForDns(srcPort, fullPacket, ihl)
+            var appName = if (appUid >= 0) uidResolver?.getPackageName(appUid) else null
+
+            // If UID resolved and app is blocked, cache the domain→UID mapping
+            if (appUid >= 0 && appUid in blockedAppUids) {
+                domainUidCache[domain] = Pair(appUid, System.currentTimeMillis())
+            }
+
+            // If UID resolution FAILED, check cache for this domain
+            // (fixes UDP socket race condition — socket closes before lookup)
+            if (appUid < 0) {
+                val cached = domainUidCache[domain]
+                if (cached != null && System.currentTimeMillis() - cached.second < 30_000) {
+                    appUid = cached.first
+                    appName = uidResolver?.getPackageName(appUid)
+                }
+            }
 
             // Check 1: App blocked → return 0.0.0.0 for ALL its queries
             if (appUid >= 0 && appUid in blockedAppUids) {
@@ -254,7 +275,7 @@ class NetGuardVpnService : VpnService() {
             // Check 2: Domain in blocklist → return 0.0.0.0
             if (domainTrie.isBlocked(domain)) {
                 writeBlockedDnsResponse(query, fullPacket, ihl, tunOutput)
-                logEvent(appName, domain, "BLOCKED")
+                logEvent(appName ?: domain, domain, "BLOCKED")
                 return
             }
 
