@@ -229,7 +229,7 @@ fun SettingsScreen(
                     Spacer(Modifier.height(8.dp))
 
                     Text(
-                        "NetGuard v1.0.0",
+                        "NetGuard v1.1.0",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

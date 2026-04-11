@@ -1,9 +1,17 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
+}
+
+// Load .env file for keystore credentials
+val envFile = rootProject.file(".env")
+val envProps = Properties().apply {
+    if (envFile.exists()) load(envFile.inputStream())
 }
 
 android {
@@ -14,15 +22,15 @@ android {
         applicationId = "com.netguard"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
         create("release") {
-            storeFile = file("netguard-release.jks")
+            storeFile = file(envProps.getProperty("KEYSTORE_FILE", "netguard-release.jks"))
             storePassword = envProps.getProperty("KEYSTORE_PASSWORD", "")
             keyAlias = envProps.getProperty("KEY_ALIAS", "netguard")
             keyPassword = envProps.getProperty("KEY_PASSWORD", "")
