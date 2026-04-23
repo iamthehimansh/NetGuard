@@ -9,11 +9,13 @@ import com.netguard.data.dao.ComboRuleDao
 import com.netguard.data.dao.DomainRuleDao
 import com.netguard.data.dao.TrafficLogDao
 import com.netguard.data.dao.TrafficStatsDao
+import com.netguard.data.dao.VpnServerConfigDao
 import com.netguard.data.entity.AppRuleEntity
 import com.netguard.data.entity.ComboRuleEntity
 import com.netguard.data.entity.DomainRuleEntity
 import com.netguard.data.entity.TrafficLogEntity
 import com.netguard.data.entity.TrafficStatsEntity
+import com.netguard.data.entity.VpnServerConfigEntity
 
 @Database(
     entities = [
@@ -21,9 +23,10 @@ import com.netguard.data.entity.TrafficStatsEntity
         DomainRuleEntity::class,
         ComboRuleEntity::class,
         TrafficLogEntity::class,
-        TrafficStatsEntity::class
+        TrafficStatsEntity::class,
+        VpnServerConfigEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -32,6 +35,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun comboRuleDao(): ComboRuleDao
     abstract fun trafficLogDao(): TrafficLogDao
     abstract fun trafficStatsDao(): TrafficStatsDao
+    abstract fun vpnServerConfigDao(): VpnServerConfigDao
 
     companion object {
         @Volatile

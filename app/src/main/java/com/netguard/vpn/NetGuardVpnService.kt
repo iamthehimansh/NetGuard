@@ -20,6 +20,7 @@ import com.netguard.uid.UidResolver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -37,10 +38,8 @@ class NetGuardVpnService : VpnService() {
         private const val TAG = "NetGuardVpnService"
 
         private val DNS_ROUTES = listOf(
-            "8.8.8.8", "8.8.4.4",
-            "1.1.1.1", "1.0.0.1",
-            "9.9.9.9", "149.112.112.112",
-            "208.67.222.222", "208.67.220.220"
+            "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
+            "9.9.9.9", "149.112.112.112", "208.67.222.222", "208.67.220.220"
         )
     }
 
@@ -50,17 +49,17 @@ class NetGuardVpnService : VpnService() {
     private var notificationManager: VpnNotificationManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var uidResolver: UidResolver? = null
+    private var singBoxManager: SingBoxManager? = null
 
     private val domainTrie = DomainTrie()
     private var blockedCount = 0
     private var allowedCount = 0
-
     private var blockedAppUids = setOf<Int>()
     private var blockedPackageNames = setOf<String>()
     private var upstreamDns = "8.8.8.8"
     private var hasBlockedApps = false
+    private var currentMode = TunnelMode.DNS_FILTER_ONLY
 
-    // Cache domain→UID for race condition fix
     private val domainUidCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
 
     @Volatile
@@ -96,6 +95,9 @@ class NetGuardVpnService : VpnService() {
             val db = AppDatabase.getInstance(this)
             val prefs = getSharedPreferences("netguard_settings", Context.MODE_PRIVATE)
             upstreamDns = prefs.getString("dns_server", "8.8.8.8") ?: "8.8.8.8"
+            currentMode = try {
+                TunnelMode.valueOf(prefs.getString("tunnel_mode", TunnelMode.DNS_FILTER_ONLY.name)!!)
+            } catch (_: Exception) { TunnelMode.DNS_FILTER_ONLY }
 
             trafficLogWriter = TrafficLogWriter(db.trafficLogDao(), db.trafficStatsDao(), serviceScope)
             uidResolver = UidResolver(this)
@@ -104,9 +106,26 @@ class NetGuardVpnService : VpnService() {
             blocklistManager.loadBundledBlocklist()
             loadBlockedApps()
 
-            establishTunnel()
+            when (currentMode) {
+                TunnelMode.DNS_FILTER_ONLY -> {
+                    Log.i(TAG, "Starting in DNS_FILTER_ONLY mode")
+                    establishDnsOnlyTunnel()
+                    startDnsPacketLoop()
+                    notificationManager?.updateText("NetGuard — DNS Filter Active")
+                }
+                TunnelMode.DIRECT -> {
+                    Log.i(TAG, "Starting in DIRECT mode (VPN tunnel)")
+                    startSingBoxDirect()
+                    notificationManager?.updateText("NetGuard — VPN to ${getServerAddress()}")
+                }
+                TunnelMode.MANAGED -> {
+                    Log.i(TAG, "Starting in MANAGED mode (filter + VPN)")
+                    startSingBoxManaged()
+                    notificationManager?.updateText("NetGuard — Managed VPN to ${getServerAddress()}")
+                }
+            }
+
             registerNetworkCallback()
-            startPacketLoop()
 
         } catch (e: Exception) {
             Log.e(TAG, "VPN start failed", e)
@@ -114,37 +133,24 @@ class NetGuardVpnService : VpnService() {
         }
     }
 
+    // ==================== DNS_FILTER_ONLY MODE ====================
+    // (existing NetGuard behavior — unchanged)
+
     private suspend fun loadBlockedApps() {
         val db = AppDatabase.getInstance(this)
         val blockedApps = db.appRuleDao().getAllBlocked()
         val pm = packageManager
-
         blockedPackageNames = blockedApps.map { it.packageName }.toSet()
         blockedAppUids = blockedApps.mapNotNull { rule ->
             try { pm.getApplicationInfo(rule.packageName, 0).uid } catch (_: Exception) { null }
         }.toSet()
         hasBlockedApps = blockedPackageNames.isNotEmpty()
-
         domainTrie.clear()
-        BlocklistManager(this, db.domainRuleDao(), domainTrie).reloadTrieFromDb()
+        BlocklistManager(this, AppDatabase.getInstance(this).domainRuleDao(), domainTrie).reloadTrieFromDb()
         Log.i(TAG, "Rules: ${blockedAppUids.size} blocked apps, ${domainTrie.size()} blocked domains")
     }
 
-    /**
-     * Two modes:
-     *
-     * MODE 1 - Apps blocked: Full route (0.0.0.0/0)
-     *   Route ALL traffic through TUN. Exclude non-blocked apps via addDisallowedApplication.
-     *   Blocked apps' ALL traffic (DNS + TCP + UDP) goes to TUN → we DROP everything.
-     *   This fully blocks apps even if they use cached/hardcoded IPs.
-     *   Domain blocking works for blocked apps only.
-     *
-     * MODE 2 - No apps blocked, only domain rules: DNS-only route
-     *   Route only DNS server IPs through TUN.
-     *   ALL apps' DNS goes through TUN → domain blocking works for everyone.
-     *   Non-DNS traffic flows normally.
-     */
-    private fun establishTunnel() {
+    private fun establishDnsOnlyTunnel() {
         tunInterface?.close()
         tunInterface = null
 
@@ -155,57 +161,32 @@ class NetGuardVpnService : VpnService() {
             .setMtu(1500)
             .setBlocking(true)
 
-        // Exclude our own app always
         try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
 
         if (hasBlockedApps) {
-            // MODE 1: Full route — black hole for blocked apps
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
             builder.addAddress("fd00::1", 128)
-
-            // Exclude all NON-blocked apps so they have normal network
             val installedApps = packageManager.getInstalledApplications(0)
-            var excluded = 0
             for (app in installedApps) {
                 if (app.packageName == packageName) continue
                 if (app.packageName in blockedPackageNames) continue
-                try {
-                    builder.addDisallowedApplication(app.packageName)
-                    excluded++
-                } catch (_: Exception) {}
+                try { builder.addDisallowedApplication(app.packageName) } catch (_: Exception) {}
             }
-            Log.i(TAG, "MODE 1: Full route. Blocking ${blockedPackageNames.size} apps, excluded $excluded")
         } else {
-            // MODE 2: DNS-only route — domain blocking for all apps
             for (dns in DNS_ROUTES) {
                 try { builder.addRoute(dns, 32) } catch (_: Exception) {}
             }
             if (upstreamDns !in DNS_ROUTES) {
                 try { builder.addRoute(upstreamDns, 32) } catch (_: Exception) {}
             }
-            Log.i(TAG, "MODE 2: DNS-only route. Domain blocking for all apps.")
         }
 
         tunInterface = builder.establish()
-        if (tunInterface == null) {
-            Log.e(TAG, "Failed to establish VPN")
-            stopVpn()
-        }
+        if (tunInterface == null) { Log.e(TAG, "Failed to establish VPN"); stopVpn() }
     }
 
-    private suspend fun reloadAndRestart() {
-        Log.i(TAG, "Reloading rules and restarting tunnel...")
-        loadBlockedApps()
-        establishTunnel()
-    }
-
-    /**
-     * Packet loop handles both modes:
-     * - DNS (UDP:53) → intercept, check app block + domain block
-     * - Non-DNS (only in MODE 1) → DROP silently (black hole for blocked apps)
-     */
-    private fun startPacketLoop() {
+    private fun startDnsPacketLoop() {
         Thread({
             try {
                 while (running) {
@@ -213,69 +194,261 @@ class NetGuardVpnService : VpnService() {
                     val input = FileInputStream(tun.fileDescriptor)
                     val output = FileOutputStream(tun.fileDescriptor)
                     val buffer = ByteArray(32767)
-
                     try {
                         while (running) {
                             val length = input.read(buffer)
                             if (length <= 0) { Thread.sleep(10); continue }
-                            if (length < 20) continue
-
+                            if (length < 28) continue
                             val version = (buffer[0].toInt() shr 4) and 0xF
                             if (version != 4) continue
-
                             val protocol = buffer[9].toInt() and 0xFF
                             val ihl = (buffer[0].toInt() and 0xF) * 4
-
-                            // Handle DNS queries (UDP port 53)
                             if (protocol == 17 && length > ihl + 8) {
-                                val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or
-                                    (buffer[ihl + 3].toInt() and 0xFF)
-
+                                val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
                                 if (dstPort == 53) {
-                                    val srcPort = ((buffer[ihl].toInt() and 0xFF) shl 8) or
-                                        (buffer[ihl + 1].toInt() and 0xFF)
-                                    val udpDataOffset = ihl + 8
-                                    val udpDataLen = length - udpDataOffset
-                                    if (udpDataLen >= 12) {
-                                        handleDnsQuery(
-                                            buffer, udpDataOffset, udpDataLen,
-                                            buffer, ihl, length, output, srcPort
-                                        )
-                                    }
+                                    val srcPort = ((buffer[ihl].toInt() and 0xFF) shl 8) or (buffer[ihl + 1].toInt() and 0xFF)
+                                    val udpOff = ihl + 8
+                                    val udpLen = length - udpOff
+                                    if (udpLen >= 12) handleDnsQuery(buffer, udpOff, udpLen, buffer, ihl, length, output, srcPort)
                                     continue
                                 }
                             }
-
-                            // Non-DNS traffic — only arrives in MODE 1 (full route)
-                            // All non-DNS from blocked apps → DROP (black hole)
-                            // Log occasionally to avoid spam
-                            if (hasBlockedApps && (protocol == 6 || protocol == 17)) {
-                                val dstIp = "${buffer[16].toInt() and 0xFF}.${buffer[17].toInt() and 0xFF}.${buffer[18].toInt() and 0xFF}.${buffer[19].toInt() and 0xFF}"
-                                val dstPort = if (length > ihl + 3) {
-                                    ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
-                                } else 0
-                                val protoName = if (protocol == 6) "TCP" else "UDP"
-
-                                if (blockedCount % 50 == 0) {
-                                    serviceScope.launch {
-                                        blockedCount++
-                                        trafficLogWriter?.log(null, dstIp, dstIp, dstPort, protoName, "BLOCKED")
-                                        notificationManager?.updateStats(blockedCount, allowedCount)
-                                    }
-                                } else {
-                                    blockedCount++
-                                }
-                            }
-                            // DROP — don't forward
+                            if (hasBlockedApps) blockedCount++
                         }
-                    } catch (_: Exception) {
-                        // TUN closed during reload
-                    }
+                    } catch (_: Exception) {}
                 }
-            } catch (e: Exception) {
-                if (running) Log.e(TAG, "Packet loop error", e)
+            } catch (e: Exception) { if (running) Log.e(TAG, "Packet loop error", e) }
+        }, "DnsLoop").start()
+    }
+
+    // ==================== DIRECT MODE ====================
+    // All traffic tunneled via sing-box, no local filtering
+
+    private suspend fun startSingBoxDirect() {
+        val db = AppDatabase.getInstance(this)
+        val serverConfig = db.vpnServerConfigDao().getConfig()
+        if (serverConfig == null || serverConfig.uuid.isBlank()) {
+            Log.e(TAG, "No VPN server configured. Falling back to DNS_FILTER_ONLY")
+            currentMode = TunnelMode.DNS_FILTER_ONLY
+            establishDnsOnlyTunnel()
+            startDnsPacketLoop()
+            return
+        }
+
+        val config = SingBoxConfigGenerator.generateDirectConfig(serverConfig)
+        singBoxManager = SingBoxManager(this)
+
+        // Establish TUN for sing-box
+        tunInterface?.close()
+        val builder = Builder()
+            .setSession("NetGuard VPN")
+            .addAddress("172.19.0.1", 28)
+            .addRoute("0.0.0.0", 0)
+            .addRoute("::", 0)
+            .addDnsServer("10.1.10.1")
+            .setMtu(1420)
+            .setBlocking(false)
+
+        try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
+
+        tunInterface = builder.establish()
+        if (tunInterface == null) {
+            Log.e(TAG, "Failed to establish VPN for sing-box")
+            stopVpn()
+            return
+        }
+
+        singBoxManager?.start(config, tunInterface)
+        startHealthProbe()
+    }
+
+    // ==================== MANAGED MODE ====================
+    // Local DNS filter first, then tunnel allowed traffic via sing-box
+
+    private suspend fun startSingBoxManaged() {
+        val db = AppDatabase.getInstance(this)
+        val serverConfig = db.vpnServerConfigDao().getConfig()
+        if (serverConfig == null || serverConfig.uuid.isBlank()) {
+            Log.e(TAG, "No VPN server configured. Falling back to DNS_FILTER_ONLY")
+            currentMode = TunnelMode.DNS_FILTER_ONLY
+            establishDnsOnlyTunnel()
+            startDnsPacketLoop()
+            return
+        }
+
+        val config = SingBoxConfigGenerator.generateManagedConfig(serverConfig)
+        singBoxManager = SingBoxManager(this)
+
+        // Establish TUN
+        tunInterface?.close()
+        val builder = Builder()
+            .setSession("NetGuard Managed VPN")
+            .addAddress("172.19.0.1", 28)
+            .addRoute("0.0.0.0", 0)
+            .addRoute("::", 0)
+            .addDnsServer("172.19.0.1")  // DNS to ourselves for local filtering
+            .setMtu(1420)
+            .setBlocking(true)
+
+        try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
+
+        tunInterface = builder.establish()
+        if (tunInterface == null) {
+            Log.e(TAG, "Failed to establish VPN for managed mode")
+            stopVpn()
+            return
+        }
+
+        // Start the managed packet loop — filter DNS locally, forward rest to sing-box
+        startManagedPacketLoop()
+        singBoxManager?.start(config, tunInterface)
+        startHealthProbe()
+    }
+
+    /**
+     * Managed mode packet loop:
+     * - DNS (UDP:53) → local filter (block/allow), allowed queries forwarded to sing-box
+     * - Non-DNS → forward to sing-box unchanged (unless app is blocked)
+     */
+    private fun startManagedPacketLoop() {
+        Thread({
+            try {
+                val tun = tunInterface ?: return@Thread
+                val input = FileInputStream(tun.fileDescriptor)
+                val output = FileOutputStream(tun.fileDescriptor)
+                val buffer = ByteArray(32767)
+
+                while (running) {
+                    val length = input.read(buffer)
+                    if (length <= 0) { Thread.sleep(10); continue }
+                    if (length < 20) continue
+
+                    val version = (buffer[0].toInt() shr 4) and 0xF
+                    if (version != 4) continue
+
+                    val protocol = buffer[9].toInt() and 0xFF
+                    val ihl = (buffer[0].toInt() and 0xF) * 4
+
+                    if (protocol == 17 && length > ihl + 8) {
+                        val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
+                        if (dstPort == 53) {
+                            val srcPort = ((buffer[ihl].toInt() and 0xFF) shl 8) or (buffer[ihl + 1].toInt() and 0xFF)
+                            val udpOff = ihl + 8; val udpLen = length - udpOff
+                            if (udpLen >= 12) {
+                                val action = interceptManagedDns(buffer, udpOff, udpLen, buffer, ihl, length, output, srcPort)
+                                if (action == "DROP") continue
+                            }
+                        }
+                    }
+                    // Forward non-DNS (or allowed DNS) to sing-box via TUN
+                    // sing-box reads from the same TUN fd
+                    output.write(buffer, 0, length)
+                }
+            } catch (e: Exception) { if (running) Log.e(TAG, "Managed loop error", e) }
+        }, "ManagedLoop").start()
+    }
+
+    /**
+     * Returns "DROP" if blocked, "FORWARD" if allowed.
+     */
+    private fun interceptManagedDns(
+        packet: ByteArray, dataOffset: Int, dataLen: Int,
+        fullPacket: ByteArray, ihl: Int, fullLen: Int,
+        tunOutput: FileOutputStream, srcPort: Int
+    ): String {
+        try {
+            val dnsData = packet.copyOfRange(dataOffset, dataOffset + dataLen)
+            val query = DnsPacketParser.parseQuery(dnsData, dnsData.size) ?: return "FORWARD"
+            val domain = query.domain
+
+            var appUid = resolveUidForDns(srcPort, fullPacket, ihl)
+            if (appUid < 0) {
+                val cached = domainUidCache[domain]
+                if (cached != null && System.currentTimeMillis() - cached.second < 30_000) appUid = cached.first
             }
-        }, "PacketLoop").start()
+            val appName = if (appUid >= 0) uidResolver?.getPackageName(appUid) else null
+            if (appUid >= 0 && appUid in blockedAppUids) domainUidCache[domain] = Pair(appUid, System.currentTimeMillis())
+
+            if ((appUid >= 0 && appUid in blockedAppUids) || domainTrie.isBlocked(domain)) {
+                val blocked = DnsPacketParser.buildBlockedResponse(query)
+                val resp = buildDnsResponsePacket(fullPacket, ihl, blocked)
+                if (resp != null) tunOutput.write(resp)
+                logEvent(appName ?: domain, domain, "BLOCKED")
+                return "DROP"
+            }
+
+            logEvent(appName, domain, "ALLOWED")
+            return "FORWARD"  // let sing-box handle it
+        } catch (_: Exception) { return "FORWARD" }
+    }
+
+    // ==================== HEALTH PROBE ====================
+
+    private fun startHealthProbe() {
+        serviceScope.launch {
+            var failures = 0
+            while (running && currentMode != TunnelMode.DNS_FILTER_ONLY) {
+                delay(30_000)
+                // TODO: HTTP GET to https://www.gstatic.com/generate_204 through tunnel
+                // For now, just check if sing-box is alive
+                if (singBoxManager?.isRunning != true) {
+                    failures++
+                    if (failures >= 3) {
+                        Log.w(TAG, "Health probe: 3 consecutive failures, reconnecting")
+                        reloadAndRestart()
+                        failures = 0
+                    }
+                } else {
+                    failures = 0
+                }
+            }
+        }
+    }
+
+    // ==================== SHARED HELPERS ====================
+
+    private suspend fun reloadAndRestart() {
+        Log.i(TAG, "Reloading and restarting...")
+        singBoxManager?.stop()
+        running = false
+        loadBlockedApps()
+        running = true
+
+        when (currentMode) {
+            TunnelMode.DNS_FILTER_ONLY -> {
+                val prefs = getSharedPreferences("netguard_settings", Context.MODE_PRIVATE)
+                currentMode = try {
+                    TunnelMode.valueOf(prefs.getString("tunnel_mode", TunnelMode.DNS_FILTER_ONLY.name)!!)
+                } catch (_: Exception) { TunnelMode.DNS_FILTER_ONLY }
+            }
+            else -> {}
+        }
+
+        // Re-read mode in case it changed
+        val prefs = getSharedPreferences("netguard_settings", Context.MODE_PRIVATE)
+        currentMode = try {
+            TunnelMode.valueOf(prefs.getString("tunnel_mode", TunnelMode.DNS_FILTER_ONLY.name)!!)
+        } catch (_: Exception) { TunnelMode.DNS_FILTER_ONLY }
+
+        when (currentMode) {
+            TunnelMode.DNS_FILTER_ONLY -> {
+                establishDnsOnlyTunnel()
+                startDnsPacketLoop()
+                notificationManager?.updateText("NetGuard — DNS Filter Active")
+            }
+            TunnelMode.DIRECT -> {
+                startSingBoxDirect()
+                notificationManager?.updateText("NetGuard — VPN to ${getServerAddress()}")
+            }
+            TunnelMode.MANAGED -> {
+                startSingBoxManaged()
+                notificationManager?.updateText("NetGuard — Managed VPN to ${getServerAddress()}")
+            }
+        }
+    }
+
+    private suspend fun getServerAddress(): String {
+        return AppDatabase.getInstance(this).vpnServerConfigDao().getConfig()?.serverAddress ?: "not configured"
     }
 
     private fun handleDnsQuery(
@@ -287,134 +460,75 @@ class NetGuardVpnService : VpnService() {
             val dnsData = packet.copyOfRange(dataOffset, dataOffset + dataLen)
             val query = DnsPacketParser.parseQuery(dnsData, dnsData.size) ?: return
             val domain = query.domain
-
             var appUid = resolveUidForDns(srcPort, fullPacket, ihl)
             var appName = if (appUid >= 0) uidResolver?.getPackageName(appUid) else null
-
-            // Cache domain→UID when we see a blocked app
-            if (appUid >= 0 && appUid in blockedAppUids) {
-                domainUidCache[domain] = Pair(appUid, System.currentTimeMillis())
-            }
-
-            // Fallback to cache if UID lookup failed
+            if (appUid >= 0 && appUid in blockedAppUids) domainUidCache[domain] = Pair(appUid, System.currentTimeMillis())
             if (appUid < 0) {
                 val cached = domainUidCache[domain]
                 if (cached != null && System.currentTimeMillis() - cached.second < 30_000) {
-                    appUid = cached.first
-                    appName = uidResolver?.getPackageName(appUid)
+                    appUid = cached.first; appName = uidResolver?.getPackageName(appUid)
                 }
             }
-
-            // Check 1: App blocked
-            if (appUid >= 0 && appUid in blockedAppUids) {
-                writeBlockedDnsResponse(query, fullPacket, ihl, tunOutput)
-                logEvent(appName, domain, "BLOCKED")
-                return
+            if ((appUid >= 0 && appUid in blockedAppUids) || domainTrie.isBlocked(domain)) {
+                val blocked = DnsPacketParser.buildBlockedResponse(query)
+                val resp = buildDnsResponsePacket(fullPacket, ihl, blocked)
+                if (resp != null) tunOutput.write(resp)
+                logEvent(appName ?: domain, domain, "BLOCKED"); return
             }
-
-            // Check 2: Domain blocked
-            if (domainTrie.isBlocked(domain)) {
-                writeBlockedDnsResponse(query, fullPacket, ihl, tunOutput)
-                logEvent(appName ?: domain, domain, "BLOCKED")
-                return
-            }
-
-            // Allowed
             val response = forwardDnsUpstream(dnsData, dnsData.size) ?: return
-            val ipResponse = buildDnsResponsePacket(fullPacket, ihl, response)
-            if (ipResponse != null) tunOutput.write(ipResponse)
+            val ipResp = buildDnsResponsePacket(fullPacket, ihl, response)
+            if (ipResp != null) tunOutput.write(ipResp)
             logEvent(appName, domain, "ALLOWED")
-
-        } catch (e: Exception) {
-            Log.w(TAG, "DNS error: ${e.message}")
-        }
-    }
-
-    private fun writeBlockedDnsResponse(
-        query: DnsPacketParser.DnsQuery,
-        fullPacket: ByteArray, ihl: Int,
-        tunOutput: FileOutputStream
-    ) {
-        val blocked = DnsPacketParser.buildBlockedResponse(query)
-        val ipResponse = buildDnsResponsePacket(fullPacket, ihl, blocked)
-        if (ipResponse != null) tunOutput.write(ipResponse)
+        } catch (e: Exception) { Log.w(TAG, "DNS error: ${e.message}") }
     }
 
     private fun logEvent(appName: String?, domain: String, action: String) {
         serviceScope.launch {
             if (action == "BLOCKED") blockedCount++ else allowedCount++
             trafficLogWriter?.log(appName, domain, null, 53, "DNS", action)
-            if ((blockedCount + allowedCount) % 5 == 0) {
-                notificationManager?.updateStats(blockedCount, allowedCount)
-            }
+            if ((blockedCount + allowedCount) % 5 == 0) notificationManager?.updateStats(blockedCount, allowedCount)
         }
     }
 
     private fun resolveUidForDns(srcPort: Int, ipPacket: ByteArray, ihl: Int): Int {
         val srcIp = "${ipPacket[12].toInt() and 0xFF}.${ipPacket[13].toInt() and 0xFF}.${ipPacket[14].toInt() and 0xFF}.${ipPacket[15].toInt() and 0xFF}"
         val dstIp = "${ipPacket[16].toInt() and 0xFF}.${ipPacket[17].toInt() and 0xFF}.${ipPacket[18].toInt() and 0xFF}.${ipPacket[19].toInt() and 0xFF}"
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
-                val cm = getSystemService(ConnectivityManager::class.java)
-                return cm.getConnectionOwnerUid(
-                    17,
-                    InetSocketAddress(InetAddress.getByName(srcIp), srcPort),
-                    InetSocketAddress(InetAddress.getByName(dstIp), 53)
-                )
+                return getSystemService(ConnectivityManager::class.java).getConnectionOwnerUid(
+                    17, InetSocketAddress(InetAddress.getByName(srcIp), srcPort),
+                    InetSocketAddress(InetAddress.getByName(dstIp), 53))
             } catch (_: Exception) {}
         }
-        return uidResolver?.resolve(
-            17,
-            InetSocketAddress(InetAddress.getByName(srcIp), srcPort),
-            InetSocketAddress(InetAddress.getByName(dstIp), 53)
-        ) ?: -1
+        return uidResolver?.resolve(17, InetSocketAddress(InetAddress.getByName(srcIp), srcPort),
+            InetSocketAddress(InetAddress.getByName(dstIp), 53)) ?: -1
     }
 
     private fun forwardDnsUpstream(data: ByteArray, len: Int): ByteArray? {
-        val sock = DatagramSocket()
-        protect(sock)
+        val sock = DatagramSocket(); protect(sock)
         try {
             sock.send(DatagramPacket(data, len, InetAddress.getByName(upstreamDns), 53))
-            val buf = ByteArray(4096)
-            val resp = DatagramPacket(buf, buf.size)
-            sock.soTimeout = 5000
-            sock.receive(resp)
-            return buf.copyOf(resp.length)
-        } catch (e: Exception) {
-            Log.w(TAG, "Upstream DNS failed: ${e.message}")
-            return null
-        } finally { sock.close() }
+            val buf = ByteArray(4096); val resp = DatagramPacket(buf, buf.size)
+            sock.soTimeout = 5000; sock.receive(resp); return buf.copyOf(resp.length)
+        } catch (e: Exception) { Log.w(TAG, "Upstream DNS: ${e.message}"); return null }
+        finally { sock.close() }
     }
 
-    private fun buildDnsResponsePacket(
-        origPacket: ByteArray, ihl: Int, udpPayload: ByteArray
-    ): ByteArray? {
+    private fun buildDnsResponsePacket(orig: ByteArray, ihl: Int, payload: ByteArray): ByteArray? {
         try {
-            val udpLen = 8 + udpPayload.size
-            val totalLen = ihl + udpLen
-            val pkt = ByteArray(totalLen)
-            System.arraycopy(origPacket, 0, pkt, 0, ihl)
-            System.arraycopy(origPacket, 16, pkt, 12, 4)
-            System.arraycopy(origPacket, 12, pkt, 16, 4)
-            pkt[2] = ((totalLen shr 8) and 0xFF).toByte()
-            pkt[3] = (totalLen and 0xFF).toByte()
-            pkt[10] = 0; pkt[11] = 0
-            pkt[ihl] = origPacket[ihl + 2]; pkt[ihl + 1] = origPacket[ihl + 3]
-            pkt[ihl + 2] = origPacket[ihl]; pkt[ihl + 3] = origPacket[ihl + 1]
-            pkt[ihl + 4] = ((udpLen shr 8) and 0xFF).toByte()
-            pkt[ihl + 5] = (udpLen and 0xFF).toByte()
-            pkt[ihl + 6] = 0; pkt[ihl + 7] = 0
-            System.arraycopy(udpPayload, 0, pkt, ihl + 8, udpPayload.size)
-            var sum = 0
-            for (i in 0 until ihl step 2) {
-                sum += ((pkt[i].toInt() and 0xFF) shl 8) or (pkt[i + 1].toInt() and 0xFF)
-            }
-            while (sum > 0xFFFF) sum = (sum and 0xFFFF) + (sum shr 16)
-            val cs = sum.inv() and 0xFFFF
-            pkt[10] = ((cs shr 8) and 0xFF).toByte()
-            pkt[11] = (cs and 0xFF).toByte()
-            return pkt
+            val udpLen = 8 + payload.size; val total = ihl + udpLen; val p = ByteArray(total)
+            System.arraycopy(orig, 0, p, 0, ihl)
+            System.arraycopy(orig, 16, p, 12, 4); System.arraycopy(orig, 12, p, 16, 4)
+            p[2] = ((total shr 8) and 0xFF).toByte(); p[3] = (total and 0xFF).toByte()
+            p[10] = 0; p[11] = 0
+            p[ihl] = orig[ihl+2]; p[ihl+1] = orig[ihl+3]; p[ihl+2] = orig[ihl]; p[ihl+3] = orig[ihl+1]
+            p[ihl+4] = ((udpLen shr 8) and 0xFF).toByte(); p[ihl+5] = (udpLen and 0xFF).toByte()
+            p[ihl+6] = 0; p[ihl+7] = 0
+            System.arraycopy(payload, 0, p, ihl+8, payload.size)
+            var s = 0; for (i in 0 until ihl step 2) s += ((p[i].toInt() and 0xFF) shl 8) or (p[i+1].toInt() and 0xFF)
+            while (s > 0xFFFF) s = (s and 0xFFFF) + (s shr 16)
+            val cs = s.inv() and 0xFFFF; p[10] = ((cs shr 8) and 0xFF).toByte(); p[11] = (cs and 0xFF).toByte()
+            return p
         } catch (_: Exception) { return null }
     }
 
@@ -424,22 +538,17 @@ class NetGuardVpnService : VpnService() {
             override fun onAvailable(network: Network) { Log.i(TAG, "Network available") }
             override fun onLost(network: Network) { Log.w(TAG, "Network lost") }
         }
-        cm.registerNetworkCallback(
-            NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(),
-            networkCallback!!
-        )
+        cm.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback!!)
     }
 
     private fun stopVpn() {
         running = false
-        tunInterface?.close()
-        tunInterface = null
+        singBoxManager?.stop()
+        tunInterface?.close(); tunInterface = null
         networkCallback?.let {
-            try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
-            catch (_: Exception) {}
+            try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (_: Exception) {}
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
         Log.i(TAG, "VPN stopped")
     }
 

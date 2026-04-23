@@ -31,6 +31,10 @@ class VpnNotificationManager(private val context: Context) {
         notificationManager.notify(NOTIF_ID, notification)
     }
 
+    fun updateText(title: String, text: String = "") {
+        notificationManager.notify(NOTIF_ID, buildNotification(title, text))
+    }
+
     private fun buildNotification(title: String, text: String): Notification {
         val openIntent = PendingIntent.getActivity(
             context, 0,

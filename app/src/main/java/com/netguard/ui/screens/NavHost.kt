@@ -11,6 +11,8 @@ object Routes {
     const val DOMAIN_RULES = "domain_rules"
     const val TRAFFIC_LOG = "traffic_log"
     const val SETTINGS = "settings"
+    const val VPN_CONFIG = "vpn_config"
+    const val CONNECTION_MODE = "connection_mode"
 }
 
 @Composable
@@ -23,7 +25,9 @@ fun NetGuardNavHost() {
                 onNavigateToApps = { navController.navigate(Routes.APP_LIST) },
                 onNavigateToDomains = { navController.navigate(Routes.DOMAIN_RULES) },
                 onNavigateToLog = { navController.navigate(Routes.TRAFFIC_LOG) },
-                onNavigateToSettings = { navController.navigate(Routes.SETTINGS) }
+                onNavigateToSettings = { navController.navigate(Routes.SETTINGS) },
+                onNavigateToVpnConfig = { navController.navigate(Routes.VPN_CONFIG) },
+                onNavigateToConnectionMode = { navController.navigate(Routes.CONNECTION_MODE) }
             )
         }
         composable(Routes.APP_LIST) {
@@ -37,6 +41,12 @@ fun NetGuardNavHost() {
         }
         composable(Routes.SETTINGS) {
             SettingsScreen(onBack = { navController.popBackStack() })
+        }
+        composable(Routes.VPN_CONFIG) {
+            VpnConfigScreen(onBack = { navController.popBackStack() })
+        }
+        composable(Routes.CONNECTION_MODE) {
+            ConnectionModeScreen(onBack = { navController.popBackStack() })
         }
     }
 }

@@ -62,6 +62,8 @@ fun HomeScreen(
     onNavigateToDomains: () -> Unit,
     onNavigateToLog: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToVpnConfig: () -> Unit = {},
+    onNavigateToConnectionMode: () -> Unit = {},
     viewModel: HomeViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
@@ -277,6 +279,10 @@ fun HomeScreen(
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 NavButton(Icons.Default.History, "Traffic Log", onNavigateToLog, Modifier.weight(1f))
                 NavButton(Icons.Default.Settings, "Settings", onNavigateToSettings, Modifier.weight(1f))
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                NavButton(Icons.Default.Shield, "VPN Server", onNavigateToVpnConfig, Modifier.weight(1f))
+                NavButton(Icons.Default.Shield, "VPN Mode", onNavigateToConnectionMode, Modifier.weight(1f))
             }
         }
     }

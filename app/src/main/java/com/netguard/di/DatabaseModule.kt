@@ -7,6 +7,7 @@ import com.netguard.data.dao.ComboRuleDao
 import com.netguard.data.dao.DomainRuleDao
 import com.netguard.data.dao.TrafficLogDao
 import com.netguard.data.dao.TrafficStatsDao
+import com.netguard.data.dao.VpnServerConfigDao
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -29,4 +30,5 @@ object DatabaseModule {
     @Provides fun provideComboRuleDao(db: AppDatabase): ComboRuleDao = db.comboRuleDao()
     @Provides fun provideTrafficLogDao(db: AppDatabase): TrafficLogDao = db.trafficLogDao()
     @Provides fun provideTrafficStatsDao(db: AppDatabase): TrafficStatsDao = db.trafficStatsDao()
+    @Provides fun provideVpnServerConfigDao(db: AppDatabase): VpnServerConfigDao = db.vpnServerConfigDao()
 }
