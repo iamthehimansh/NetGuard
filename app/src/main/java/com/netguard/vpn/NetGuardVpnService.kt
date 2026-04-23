@@ -222,7 +222,8 @@ class NetGuardVpnService : VpnService() {
     }
 
     // ==================== DIRECT MODE ====================
-    // All traffic tunneled via sing-box, no local filtering
+    // All traffic tunneled via sing-box, no local filtering.
+    // libbox creates the TUN itself via PlatformInterface.openTun()
 
     private suspend fun startSingBoxDirect() {
         val db = AppDatabase.getInstance(this)
@@ -236,29 +237,8 @@ class NetGuardVpnService : VpnService() {
         }
 
         val config = SingBoxConfigGenerator.generateDirectConfig(serverConfig)
-        singBoxManager = SingBoxManager(this)
-
-        // Establish TUN for sing-box
-        tunInterface?.close()
-        val builder = Builder()
-            .setSession("NetGuard VPN")
-            .addAddress("172.19.0.1", 28)
-            .addRoute("0.0.0.0", 0)
-            .addRoute("::", 0)
-            .addDnsServer("10.1.10.1")
-            .setMtu(1420)
-            .setBlocking(false)
-
-        try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
-
-        tunInterface = builder.establish()
-        if (tunInterface == null) {
-            Log.e(TAG, "Failed to establish VPN for sing-box")
-            stopVpn()
-            return
-        }
-
-        singBoxManager?.start(config, tunInterface)
+        singBoxManager = SingBoxManager(this, this)
+        singBoxManager?.start(config)
         startHealthProbe()
     }
 
@@ -277,110 +257,23 @@ class NetGuardVpnService : VpnService() {
         }
 
         val config = SingBoxConfigGenerator.generateManagedConfig(serverConfig)
-        singBoxManager = SingBoxManager(this)
 
-        // Establish TUN
-        tunInterface?.close()
-        val builder = Builder()
-            .setSession("NetGuard Managed VPN")
-            .addAddress("172.19.0.1", 28)
-            .addRoute("0.0.0.0", 0)
-            .addRoute("::", 0)
-            .addDnsServer("172.19.0.1")  // DNS to ourselves for local filtering
-            .setMtu(1420)
-            .setBlocking(true)
+        // Collect non-blocked packages to exclude from tunnel
+        val pm = packageManager
+        val allApps = pm.getInstalledApplications(0)
+        val excludeFromTunnel = allApps
+            .map { it.packageName }
+            .filter { it !in blockedPackageNames && it != packageName }
+            .toSet()
 
-        try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
-
-        tunInterface = builder.establish()
-        if (tunInterface == null) {
-            Log.e(TAG, "Failed to establish VPN for managed mode")
-            stopVpn()
-            return
-        }
-
-        // Start the managed packet loop — filter DNS locally, forward rest to sing-box
-        startManagedPacketLoop()
-        singBoxManager?.start(config, tunInterface)
+        singBoxManager = SingBoxManager(this, this)
+        singBoxManager?.start(config, excludeFromTunnel)
         startHealthProbe()
     }
 
-    /**
-     * Managed mode packet loop:
-     * - DNS (UDP:53) → local filter (block/allow), allowed queries forwarded to sing-box
-     * - Non-DNS → forward to sing-box unchanged (unless app is blocked)
-     */
-    private fun startManagedPacketLoop() {
-        Thread({
-            try {
-                val tun = tunInterface ?: return@Thread
-                val input = FileInputStream(tun.fileDescriptor)
-                val output = FileOutputStream(tun.fileDescriptor)
-                val buffer = ByteArray(32767)
-
-                while (running) {
-                    val length = input.read(buffer)
-                    if (length <= 0) { Thread.sleep(10); continue }
-                    if (length < 20) continue
-
-                    val version = (buffer[0].toInt() shr 4) and 0xF
-                    if (version != 4) continue
-
-                    val protocol = buffer[9].toInt() and 0xFF
-                    val ihl = (buffer[0].toInt() and 0xF) * 4
-
-                    if (protocol == 17 && length > ihl + 8) {
-                        val dstPort = ((buffer[ihl + 2].toInt() and 0xFF) shl 8) or (buffer[ihl + 3].toInt() and 0xFF)
-                        if (dstPort == 53) {
-                            val srcPort = ((buffer[ihl].toInt() and 0xFF) shl 8) or (buffer[ihl + 1].toInt() and 0xFF)
-                            val udpOff = ihl + 8; val udpLen = length - udpOff
-                            if (udpLen >= 12) {
-                                val action = interceptManagedDns(buffer, udpOff, udpLen, buffer, ihl, length, output, srcPort)
-                                if (action == "DROP") continue
-                            }
-                        }
-                    }
-                    // Forward non-DNS (or allowed DNS) to sing-box via TUN
-                    // sing-box reads from the same TUN fd
-                    output.write(buffer, 0, length)
-                }
-            } catch (e: Exception) { if (running) Log.e(TAG, "Managed loop error", e) }
-        }, "ManagedLoop").start()
-    }
-
-    /**
-     * Returns "DROP" if blocked, "FORWARD" if allowed.
-     */
-    private fun interceptManagedDns(
-        packet: ByteArray, dataOffset: Int, dataLen: Int,
-        fullPacket: ByteArray, ihl: Int, fullLen: Int,
-        tunOutput: FileOutputStream, srcPort: Int
-    ): String {
-        try {
-            val dnsData = packet.copyOfRange(dataOffset, dataOffset + dataLen)
-            val query = DnsPacketParser.parseQuery(dnsData, dnsData.size) ?: return "FORWARD"
-            val domain = query.domain
-
-            var appUid = resolveUidForDns(srcPort, fullPacket, ihl)
-            if (appUid < 0) {
-                val cached = domainUidCache[domain]
-                if (cached != null && System.currentTimeMillis() - cached.second < 30_000) appUid = cached.first
-            }
-            val appName = if (appUid >= 0) uidResolver?.getPackageName(appUid) else null
-            if (appUid >= 0 && appUid in blockedAppUids) domainUidCache[domain] = Pair(appUid, System.currentTimeMillis())
-
-            if ((appUid >= 0 && appUid in blockedAppUids) || domainTrie.isBlocked(domain)) {
-                val blocked = DnsPacketParser.buildBlockedResponse(query)
-                val resp = buildDnsResponsePacket(fullPacket, ihl, blocked)
-                if (resp != null) tunOutput.write(resp)
-                logEvent(appName ?: domain, domain, "BLOCKED")
-                return "DROP"
-            }
-
-            logEvent(appName, domain, "ALLOWED")
-            return "FORWARD"  // let sing-box handle it
-        } catch (_: Exception) { return "FORWARD" }
-    }
+    // Managed mode uses libbox with excludePackage for blocked apps.
+    // DNS goes through Pi-hole on the server. Per-app blocking via
+    // OverrideOptions.excludePackage passed to sing-box start.
 
     // ==================== HEALTH PROBE ====================
 

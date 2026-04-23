@@ -1,26 +1,31 @@
 package com.netguard.vpn
 
-import android.content.Context
-import android.os.ParcelFileDescriptor
+import android.net.VpnService
 import android.util.Log
+import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.CommandServerHandler
+import io.nekohasekai.libbox.ConnectionOwner
+import io.nekohasekai.libbox.InterfaceUpdateListener
+import io.nekohasekai.libbox.LocalDNSTransport
+import io.nekohasekai.libbox.NetworkInterfaceIterator
+import io.nekohasekai.libbox.Notification
+import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.PlatformInterface
+import io.nekohasekai.libbox.StringIterator
+import io.nekohasekai.libbox.SystemProxyStatus
+import io.nekohasekai.libbox.TunOptions
+import io.nekohasekai.libbox.WIFIState
 
-/**
- * Manages the sing-box (libbox) lifecycle.
- *
- * Requires the libbox AAR to be added to the project.
- * Download from: https://github.com/SagerNet/sing-box/releases
- * Place in app/libs/ and add to build.gradle.kts:
- *   implementation(files("libs/libbox.aar"))
- *
- * When libbox is not available, this falls back to a stub that logs errors.
- */
-class SingBoxManager(private val context: Context) {
+class SingBoxManager(
+    private val service: NetGuardVpnService,
+    private val vpnService: VpnService
+) : CommandServerHandler, PlatformInterface {
 
     companion object {
         private const val TAG = "SingBoxManager"
     }
 
-    private var boxService: Any? = null
+    private var commandServer: CommandServer? = null
 
     @Volatile
     var isRunning = false
@@ -28,71 +33,141 @@ class SingBoxManager(private val context: Context) {
 
     var onStatusChange: ((Boolean, String) -> Unit)? = null
 
-    /**
-     * Start sing-box with the given JSON config.
-     */
-    fun start(config: String, tunFd: ParcelFileDescriptor?) {
-        if (isRunning) {
-            Log.w(TAG, "Already running, stopping first")
-            stop()
-        }
-
+    fun start(config: String, excludePackages: Set<String> = emptySet()) {
+        if (isRunning) stop()
         try {
-            // Try to use libbox via reflection (works when AAR is present)
-            val libboxClass = Class.forName("io.nekohasekai.libbox.Libbox")
-            val setupMethod = libboxClass.getMethod("setup", String::class.java, String::class.java, Boolean::class.javaPrimitiveType)
-            setupMethod.invoke(null, context.filesDir.absolutePath, context.cacheDir.absolutePath, false)
-
-            val newServiceMethod = libboxClass.getMethod("newStandaloneCommandClient")
-            // ... libbox API varies by version
-
-            Log.i(TAG, "libbox started with config")
+            commandServer = CommandServer(this, this).also { server ->
+                server.start()
+                val options = OverrideOptions()
+                if (excludePackages.isNotEmpty()) {
+                    options.excludePackage = toStringIterator(excludePackages)
+                }
+                server.startOrReloadService(config, options)
+            }
             isRunning = true
             onStatusChange?.invoke(true, "Connected")
-        } catch (e: ClassNotFoundException) {
-            // libbox not available — start in stub mode
-            Log.w(TAG, "libbox not found. Install the AAR from sing-box releases.")
-            Log.w(TAG, "Running in stub mode — no actual tunnel will be created.")
-            startStubMode(config)
+            Log.i(TAG, "sing-box started")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start libbox", e)
+            Log.e(TAG, "Failed to start sing-box", e)
+            isRunning = false
             onStatusChange?.invoke(false, "Error: ${e.message}")
         }
     }
 
-    /**
-     * Stub mode: log the config and pretend to be connected.
-     * Used when libbox AAR hasn't been added yet.
-     */
-    private fun startStubMode(config: String) {
-        Log.i(TAG, "=== STUB MODE: sing-box config ===")
-        Log.i(TAG, config.take(500))
-        isRunning = true
-        onStatusChange?.invoke(true, "Connected (stub)")
-    }
-
     fun stop() {
-        try {
-            if (boxService != null) {
-                val closeMethod = boxService!!.javaClass.getMethod("close")
-                closeMethod.invoke(boxService)
-                boxService = null
-            }
-        } catch (_: Exception) {}
-
+        try { commandServer?.closeService() } catch (_: Exception) {}
+        try { commandServer?.close() } catch (_: Exception) {}
+        commandServer = null
         isRunning = false
         onStatusChange?.invoke(false, "Disconnected")
         Log.i(TAG, "sing-box stopped")
     }
 
-    fun getStats(): TunnelStats {
-        // TODO: read from libbox when available
-        return TunnelStats(0, 0, 0)
+    // ===== CommandServerHandler =====
+
+    override fun getSystemProxyStatus(): SystemProxyStatus? = null
+    override fun serviceReload() { Log.i(TAG, "Reload requested") }
+    override fun serviceStop() {
+        isRunning = false
+        onStatusChange?.invoke(false, "Stopped")
+    }
+    override fun setSystemProxyEnabled(enabled: Boolean) {}
+    override fun writeDebugMessage(message: String) { Log.d(TAG, message) }
+
+    // ===== PlatformInterface =====
+
+    override fun openTun(options: TunOptions): Int {
+        val builder = vpnService.javaClass.getMethod("newBuilder")
+            .let { null } // VpnService.Builder is not directly accessible
+
+        // Use reflection to call the protected Builder
+        val builderObj = VpnService.Builder::class.java
+            .getDeclaredConstructor(VpnService::class.java)
+            .apply { isAccessible = true }
+            .newInstance(vpnService)
+
+        builderObj.setSession("NetGuard VPN")
+        builderObj.setMtu(options.mtu)
+
+        // IPv4 addresses
+        val inet4Addr = options.inet4Address
+        while (inet4Addr.hasNext()) {
+            val prefix = inet4Addr.next()
+            builderObj.addAddress(prefix.address(), prefix.prefix())
+        }
+        // IPv4 routes
+        val inet4Route = options.inet4RouteAddress
+        while (inet4Route.hasNext()) {
+            val prefix = inet4Route.next()
+            builderObj.addRoute(prefix.address(), prefix.prefix())
+        }
+        // IPv6 addresses
+        val inet6Addr = options.inet6Address
+        while (inet6Addr.hasNext()) {
+            val prefix = inet6Addr.next()
+            builderObj.addAddress(prefix.address(), prefix.prefix())
+        }
+        // IPv6 routes
+        val inet6Route = options.inet6RouteAddress
+        while (inet6Route.hasNext()) {
+            val prefix = inet6Route.next()
+            builderObj.addRoute(prefix.address(), prefix.prefix())
+        }
+        // DNS
+        try {
+            val dnsBox = options.dnsServerAddress
+            val dnsAddr = dnsBox.value
+            if (dnsAddr.isNotBlank()) builderObj.addDnsServer(dnsAddr)
+        } catch (_: Exception) {}
+
+        // Per-app routing from TunOptions
+        try {
+            val include = options.includePackage
+            while (include.hasNext()) {
+                try { builderObj.addAllowedApplication(include.next()) } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+        try {
+            val exclude = options.excludePackage
+            while (exclude.hasNext()) {
+                try { builderObj.addDisallowedApplication(exclude.next()) } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+
+        // Always exclude ourselves
+        try { builderObj.addDisallowedApplication(service.packageName) } catch (_: Exception) {}
+
+        val tun = builderObj.establish()
+            ?: throw Exception("Failed to establish VPN interface")
+
+        return tun.detachFd()
     }
 
-    data class TunnelStats(
-        val rxBytes: Long,
-        val txBytes: Long,
-        val uptimeSeconds: Long
-    )
+    override fun autoDetectInterfaceControl(fd: Int) {
+        vpnService.protect(fd)
+    }
+
+    override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
+    override fun useProcFS(): Boolean = false
+    override fun includeAllNetworks(): Boolean = false
+    override fun underNetworkExtension(): Boolean = false
+    override fun findConnectionOwner(p: Int, sa: String, sp: Int, da: String, dp: Int): ConnectionOwner? = null
+    override fun clearDNSCache() {}
+    override fun readWIFIState(): WIFIState? = null
+    override fun startDefaultInterfaceMonitor(l: InterfaceUpdateListener) {}
+    override fun closeDefaultInterfaceMonitor(l: InterfaceUpdateListener) {}
+    override fun getInterfaces(): NetworkInterfaceIterator? = null
+    override fun localDNSTransport(): LocalDNSTransport? = null
+    override fun systemCertificates(): StringIterator? = null
+    override fun sendNotification(n: Notification) {}
+
+    private fun toStringIterator(set: Set<String>): StringIterator {
+        val list = set.toList()
+        return object : StringIterator {
+            private var i = 0
+            override fun hasNext(): Boolean = i < list.size
+            override fun next(): String = list[i++]
+            override fun len(): Int = list.size
+        }
+    }
 }

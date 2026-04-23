@@ -26,6 +26,10 @@ android {
         versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
     }
 
     signingConfigs {
@@ -46,6 +50,15 @@ android {
                 "proguard-rules.pro"
             )
             signingConfig = signingConfigs.getByName("release")
+        }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = true
         }
     }
 
@@ -103,6 +116,9 @@ dependencies {
 
     // OkHttp
     implementation(libs.okhttp)
+
+    // sing-box (libbox) — VLESS VPN tunnel
+    implementation("com.github.singbox-android:libbox:1.13.11")
 
     // Core
     implementation(libs.core.ktx)
