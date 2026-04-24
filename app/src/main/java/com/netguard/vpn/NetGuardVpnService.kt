@@ -17,6 +17,7 @@ import com.netguard.dns.DnsPacketParser
 import com.netguard.dns.DomainTrie
 import com.netguard.notification.VpnNotificationManager
 import com.netguard.uid.UidResolver
+import io.nekohasekai.libbox.TunOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -237,7 +238,7 @@ class NetGuardVpnService : VpnService() {
         }
 
         val config = SingBoxConfigGenerator.generateDirectConfig(serverConfig)
-        singBoxManager = SingBoxManager(this, this)
+        singBoxManager = SingBoxManager(this)
         singBoxManager?.start(config)
         startHealthProbe()
     }
@@ -266,7 +267,7 @@ class NetGuardVpnService : VpnService() {
             .filter { it !in blockedPackageNames && it != packageName }
             .toSet()
 
-        singBoxManager = SingBoxManager(this, this)
+        singBoxManager = SingBoxManager(this)
         singBoxManager?.start(config, excludeFromTunnel)
         startHealthProbe()
     }
@@ -274,6 +275,82 @@ class NetGuardVpnService : VpnService() {
     // Managed mode uses libbox with excludePackage for blocked apps.
     // DNS goes through Pi-hole on the server. Per-app blocking via
     // OverrideOptions.excludePackage passed to sing-box start.
+
+    // ==================== TUN FD FOR LIBBOX ====================
+
+    /**
+     * Called by SingBoxManager.openTun() — creates a VPN TUN interface
+     * using VpnService.Builder and returns the raw file descriptor.
+     */
+    fun createTunFd(options: TunOptions): Int {
+        Log.i(TAG, "Creating TUN fd for libbox, MTU=${options.mtu}")
+
+        val builder = Builder()
+            .setSession("NetGuard VPN")
+            .setMtu(options.mtu)
+
+        // IPv4 addresses
+        val inet4Addr = options.inet4Address
+        while (inet4Addr.hasNext()) {
+            val prefix = inet4Addr.next()
+            builder.addAddress(prefix.address(), prefix.prefix())
+        }
+        // IPv4 routes
+        val inet4Route = options.inet4RouteAddress
+        while (inet4Route.hasNext()) {
+            val prefix = inet4Route.next()
+            builder.addRoute(prefix.address(), prefix.prefix())
+        }
+        // IPv6 addresses
+        try {
+            val inet6Addr = options.inet6Address
+            while (inet6Addr.hasNext()) {
+                val prefix = inet6Addr.next()
+                builder.addAddress(prefix.address(), prefix.prefix())
+            }
+        } catch (_: Exception) {}
+        // IPv6 routes
+        try {
+            val inet6Route = options.inet6RouteAddress
+            while (inet6Route.hasNext()) {
+                val prefix = inet6Route.next()
+                builder.addRoute(prefix.address(), prefix.prefix())
+            }
+        } catch (_: Exception) {}
+
+        // DNS
+        try {
+            val dnsBox = options.dnsServerAddress
+            val dnsAddr = dnsBox.value
+            if (!dnsAddr.isNullOrBlank()) builder.addDnsServer(dnsAddr)
+        } catch (_: Exception) {
+            builder.addDnsServer("8.8.8.8")
+        }
+
+        // Per-app include/exclude from TunOptions
+        try {
+            val include = options.includePackage
+            while (include.hasNext()) {
+                try { builder.addAllowedApplication(include.next()) } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+        try {
+            val exclude = options.excludePackage
+            while (exclude.hasNext()) {
+                try { builder.addDisallowedApplication(exclude.next()) } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+
+        // Always exclude our own app
+        try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
+
+        val tunInterface = builder.establish()
+            ?: throw Exception("VpnService.Builder.establish() returned null")
+
+        val fd = tunInterface.detachFd()
+        Log.i(TAG, "TUN fd created: $fd")
+        return fd
+    }
 
     // ==================== HEALTH PROBE ====================
 

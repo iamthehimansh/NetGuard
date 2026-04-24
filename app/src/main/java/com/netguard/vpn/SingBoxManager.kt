@@ -1,6 +1,5 @@
 package com.netguard.vpn
 
-import android.net.VpnService
 import android.util.Log
 import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
@@ -17,8 +16,7 @@ import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
 
 class SingBoxManager(
-    private val service: NetGuardVpnService,
-    private val vpnService: VpnService
+    private val service: NetGuardVpnService
 ) : CommandServerHandler, PlatformInterface {
 
     companion object {
@@ -36,6 +34,7 @@ class SingBoxManager(
     fun start(config: String, excludePackages: Set<String> = emptySet()) {
         if (isRunning) stop()
         try {
+            Log.i(TAG, "Starting sing-box...")
             commandServer = CommandServer(this, this).also { server ->
                 server.start()
                 val options = OverrideOptions()
@@ -46,7 +45,7 @@ class SingBoxManager(
             }
             isRunning = true
             onStatusChange?.invoke(true, "Connected")
-            Log.i(TAG, "sing-box started")
+            Log.i(TAG, "sing-box started successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start sing-box", e)
             isRunning = false
@@ -55,8 +54,8 @@ class SingBoxManager(
     }
 
     fun stop() {
-        try { commandServer?.closeService() } catch (_: Exception) {}
-        try { commandServer?.close() } catch (_: Exception) {}
+        try { commandServer?.closeService() } catch (e: Exception) { Log.w(TAG, "closeService: ${e.message}") }
+        try { commandServer?.close() } catch (e: Exception) { Log.w(TAG, "close: ${e.message}") }
         commandServer = null
         isRunning = false
         onStatusChange?.invoke(false, "Disconnected")
@@ -76,75 +75,17 @@ class SingBoxManager(
 
     // ===== PlatformInterface =====
 
+    /**
+     * Called by libbox when it needs a TUN fd.
+     * We delegate to NetGuardVpnService which can create a Builder directly.
+     */
     override fun openTun(options: TunOptions): Int {
-        val builder = vpnService.javaClass.getMethod("newBuilder")
-            .let { null } // VpnService.Builder is not directly accessible
-
-        // Use reflection to call the protected Builder
-        val builderObj = VpnService.Builder::class.java
-            .getDeclaredConstructor(VpnService::class.java)
-            .apply { isAccessible = true }
-            .newInstance(vpnService)
-
-        builderObj.setSession("NetGuard VPN")
-        builderObj.setMtu(options.mtu)
-
-        // IPv4 addresses
-        val inet4Addr = options.inet4Address
-        while (inet4Addr.hasNext()) {
-            val prefix = inet4Addr.next()
-            builderObj.addAddress(prefix.address(), prefix.prefix())
-        }
-        // IPv4 routes
-        val inet4Route = options.inet4RouteAddress
-        while (inet4Route.hasNext()) {
-            val prefix = inet4Route.next()
-            builderObj.addRoute(prefix.address(), prefix.prefix())
-        }
-        // IPv6 addresses
-        val inet6Addr = options.inet6Address
-        while (inet6Addr.hasNext()) {
-            val prefix = inet6Addr.next()
-            builderObj.addAddress(prefix.address(), prefix.prefix())
-        }
-        // IPv6 routes
-        val inet6Route = options.inet6RouteAddress
-        while (inet6Route.hasNext()) {
-            val prefix = inet6Route.next()
-            builderObj.addRoute(prefix.address(), prefix.prefix())
-        }
-        // DNS
-        try {
-            val dnsBox = options.dnsServerAddress
-            val dnsAddr = dnsBox.value
-            if (dnsAddr.isNotBlank()) builderObj.addDnsServer(dnsAddr)
-        } catch (_: Exception) {}
-
-        // Per-app routing from TunOptions
-        try {
-            val include = options.includePackage
-            while (include.hasNext()) {
-                try { builderObj.addAllowedApplication(include.next()) } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
-        try {
-            val exclude = options.excludePackage
-            while (exclude.hasNext()) {
-                try { builderObj.addDisallowedApplication(exclude.next()) } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
-
-        // Always exclude ourselves
-        try { builderObj.addDisallowedApplication(service.packageName) } catch (_: Exception) {}
-
-        val tun = builderObj.establish()
-            ?: throw Exception("Failed to establish VPN interface")
-
-        return tun.detachFd()
+        Log.i(TAG, "openTun called by libbox, MTU=${options.mtu}")
+        return service.createTunFd(options)
     }
 
     override fun autoDetectInterfaceControl(fd: Int) {
-        vpnService.protect(fd)
+        service.protect(fd)
     }
 
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
@@ -159,7 +100,9 @@ class SingBoxManager(
     override fun getInterfaces(): NetworkInterfaceIterator? = null
     override fun localDNSTransport(): LocalDNSTransport? = null
     override fun systemCertificates(): StringIterator? = null
-    override fun sendNotification(n: Notification) {}
+    override fun sendNotification(n: Notification) {
+        Log.d(TAG, "Notification from libbox")
+    }
 
     private fun toStringIterator(set: Set<String>): StringIterator {
         val list = set.toList()
